@@ -1,0 +1,195 @@
+import numpy as np
+from scipy.optimize import minimize
+import serial
+import time
+
+# ==============================
+# Constants and Workspace Limits
+# ==============================
+MAX_HEIGHT = 79.7             # cm
+MAX_HORIZONTAL_REACH = 55     # cm
+BAUD_RATE = 9600            # Ensure this matches your Arduino code
+SERIAL_PORT = "COM3"          # Update as needed for your system
+
+# ==============================
+# Kinematics Helper Functions
+# ==============================
+def deg_to_rad(deg):
+    return np.radians(deg)
+
+def dh_transform(theta, a, alpha, d):
+    """
+    Returns the homogeneous transformation matrix for given DH parameters.
+    Angles theta and alpha are in degrees.
+    """
+    theta_rad = deg_to_rad(theta)
+    alpha_rad = deg_to_rad(alpha)
+    return np.array([
+        [np.cos(theta_rad), -np.sin(theta_rad)*np.cos(alpha_rad), np.sin(theta_rad)*np.sin(alpha_rad), a*np.cos(theta_rad)],
+        [np.sin(theta_rad),  np.cos(theta_rad)*np.cos(alpha_rad), -np.cos(theta_rad)*np.sin(alpha_rad), a*np.sin(theta_rad)],
+        [0,                 np.sin(alpha_rad),                 np.cos(alpha_rad),                d],
+        [0, 0, 0, 1]
+    ])
+
+def forward_kinematics(thetas):
+    """
+    Computes the end-effector position from joint angles.
+    thetas: [theta1, theta2, theta3, theta4] in degrees.
+    Here, an offset of +90° is applied to theta2.
+    """
+    theta1, theta2, theta3, theta4 = thetas
+    theta2_mod = theta2 + 90
+
+    # DH parameters for each joint:
+    T01 = dh_transform(theta1, 0, 90, 23.5)    # Base
+    T12 = dh_transform(theta2_mod, 23, 0, 0)     # Shoulder
+    T23 = dh_transform(theta3, 20.2, 0, 0)        # Upper Arm
+    T34 = dh_transform(theta4, 13, 0, 0)           # Wrist
+    
+    T04 = T01 @ T12 @ T23 @ T34
+    pos = T04[:3, 3]  # End-effector position (x, y, z)
+    return pos
+
+def error_function(thetas, target, expected_base_angle, base_weight=1.0):
+    """
+    Computes the error as the sum of the positional error and a weighted penalty
+    for deviation of the base angle from the expected value.
+    """
+    pos = forward_kinematics(thetas)
+    position_error = np.linalg.norm(pos - target)
+    base_angle = thetas[0]
+    base_angle_deviation = np.abs(base_angle - expected_base_angle)
+    total_error = position_error + base_weight * base_angle_deviation
+    return total_error
+
+def is_within_workspace(target):
+    """
+    Checks if the target position (x, y, z) is within the robot's workspace.
+    """
+    x, y, z = target
+    radial_distance = np.sqrt(x*2 + y*2)
+    if radial_distance > MAX_HORIZONTAL_REACH:
+        return False, f"Target exceeds horizontal reach limit of {MAX_HORIZONTAL_REACH} cm."
+    if z > MAX_HEIGHT or z < 0:
+        return False, f"Target exceeds vertical limits (0 cm <= z <= {MAX_HEIGHT} cm)."
+    return True, "Target is within the workspace."
+
+def inverse_kinematics(target, initial_guess=[0, 0, 0, 0], base_weight=1.0):
+    """
+    Solves for joint angles [theta1, theta2, theta3, theta4] in degrees
+    that minimize the error between the computed end-effector position and the target.
+    """
+    valid, message = is_within_workspace(target)
+    if not valid:
+        print(message)
+        return None
+    
+    expected_base_angle = np.degrees(np.arctan2(target[1], target[0]))
+    bounds = [(-180, 180), (-100, 100), (-100, 100), (-100, 100)]
+    
+    result = minimize(lambda th: error_function(th, target, expected_base_angle, base_weight),
+                      initial_guess,
+                      method='SLSQP',
+                      bounds=bounds,
+                      options={'maxiter': 10000, 'ftol': 1e-6, 'disp': True})
+    return result
+
+# ==============================
+# Serial Communication Functions
+# ==============================
+def send_angles_to_arduino(angles):
+    """
+    Opens a serial connection, sends the joint angles, waits for an ACK,
+    and then sends the execution command upon user confirmation.
+    """
+    try:
+        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2) as ser:
+            time.sleep(2)  # Allow Arduino to reset
+            start_time = time.time()
+            while True:
+                if ser.in_waiting > 0:
+                    line = ser.readline().decode().strip()
+                    print(f"Discarding: {line}")
+                    if line == "READY":
+                        break
+                if time.time() - start_time > 5:  # timeout after 5 sec
+                    break
+
+            # Now send the angles
+            message = angles + "\n"
+            ser.write(message.encode())
+            print(f"Sent angles to Arduino: {angles}")
+            
+            # Wait for ACK, ignoring any lines until one equals "ACK"
+            ack_received = False
+            start_time = time.time()
+            while time.time() - start_time < 5:  # 5-second timeout
+                if ser.in_waiting > 0:
+                    response = ser.readline().decode().strip()
+                    print(f"Arduino response: {response}")
+                    if response == "ACK":
+                        ack_received = True
+                        break
+            if not ack_received:
+                print("ACK not received within timeout. Exiting.")
+                return
+
+            print("Joint angles received by Arduino. Type 'e' to execute.")
+            
+            # Wait for user to confirm execution by typing 'e'
+            while True:
+                user_input = input("Enter 'e' to execute: ").strip()
+                if user_input.lower() == "e":
+                    ser.write(b"e\n")
+                    print("Execution command sent to Arduino.")
+                    break
+                else:
+                    print("Invalid input. Please type 'e'.")
+    except serial.SerialException as e:
+        print(f"Error communicating with Arduino: {e}")
+
+
+# ==============================
+# Main Function: IK and Send
+# ==============================
+def main():
+    # Prompt user for target end-effector position
+    print("Please enter the target end-effector position (x, y, z) in cm (separated by commas):")
+    user_input = input("Enter x, y, z: ")
+    try:
+        x, y, z = map(float, user_input.split(','))
+    except ValueError:
+        print("Invalid input format. Please enter three numerical values separated by commas.")
+        return
+    target = np.array([x, y, z])
+    
+    # Solve inverse kinematics
+    result = inverse_kinematics(target, initial_guess=[0, 0, 0, 0], base_weight=10.0)
+    if result is None:
+        return
+    optimized_thetas = result.x
+    expected_base_angle = np.degrees(np.arctan2(y, x))
+    final_position = forward_kinematics(optimized_thetas)
+    final_error = np.linalg.norm(final_position - target)
+    
+    print("\nOptimization terminated successfully:")
+    print(f"Expected Base Angle (from atan2): {expected_base_angle:.2f}°")
+    print("Optimized Joint Angles (Base, Shoulder, Upper Arm, Wrist):")
+    angles_str = f"{optimized_thetas[0]:.2f},{optimized_thetas[1]:.2f},{optimized_thetas[2]:.2f},{optimized_thetas[3]:.2f}"
+    print(angles_str)
+    print(f"Computed End-Effector Position: {final_position}")
+    print(f"Final Position Error: {final_error:.10f}")
+    
+    # Optionally, save angles to a file (if you need to use them separately)
+    try:
+        with open("angles.txt", "w") as f:
+            f.write(angles_str + "\n")
+        print("Joint angles saved to angles.txt")
+    except Exception as e:
+        print(f"Error writing to file: {e}")
+    
+    # Send the computed angles to Arduino
+    send_angles_to_arduino(angles_str)
+
+if __name__ == "__main__":
+    main()
