@@ -1,0 +1,530 @@
+#include <AccelStepper.h>
+#include <Servo.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+/* ---------------------------
+   Stepper Motor Configuration
+   --------------------------- */
+// Define stepper motor pins (for a typical RAMPS board)
+#define X_STEP_PIN 54
+#define X_DIR_PIN 55
+#define Y_STEP_PIN 60
+#define Y_DIR_PIN 61
+#define Z_STEP_PIN 46
+#define Z_DIR_PIN 48
+#define E0_STEP_PIN 26
+#define E0_DIR_PIN 28
+#define E1_STEP_PIN 36
+#define E1_DIR_PIN 34
+
+// Create stepper motor objects
+AccelStepper stepperX(AccelStepper::DRIVER, X_STEP_PIN, X_DIR_PIN);
+AccelStepper stepperY(AccelStepper::DRIVER, Y_STEP_PIN, Y_DIR_PIN);
+AccelStepper stepperZ(AccelStepper::DRIVER, Z_STEP_PIN, Z_DIR_PIN);
+AccelStepper stepperE0(AccelStepper::DRIVER, E0_STEP_PIN, E0_DIR_PIN);
+AccelStepper stepperE1(AccelStepper::DRIVER, E1_STEP_PIN, E1_DIR_PIN);
+
+// Array of steppers and their labels (x, y, z, p, q)
+AccelStepper* steppers[] = { &stepperX, &stepperY, &stepperZ, &stepperE0, &stepperE1 };
+char motorLabels[] = {'x', 'y', 'z', 'p', 'q'};
+
+// Steps per degree (for 1/16 microstepping)
+const float stepsPerDegree = 3200.0 / 360.0; // ≈8.8889 steps/degree
+
+// Scaling factors for stepper motors (for x, y, z, q; for motor p use direct conversion)
+const float scaleFactorX = 6000.0 / 90.0;
+const float scaleFactorY = 450.0 / 90.0;
+const float scaleFactorZ = 770.0 / 90.0;
+const float scaleFactorQ = 820.0 / 90.0;
+
+// Maximum steps per incremental move (to avoid huge numbers)
+const long MAX_STEPS_PER_MOVE = 30000;
+
+/* ---------------
+   Default Settings
+   --------------- */
+// Motor X defaults
+const long DEFAULT_X_MAX_SPEED = 1000;
+const long DEFAULT_X_ACCEL = 500;
+
+// Motor Y defaults
+const long DEFAULT_Y_MAX_SPEED = 200;
+const long DEFAULT_Y_ACCEL = 100;
+
+// Motor Z defaults
+const long DEFAULT_Z_MAX_SPEED = 200;
+const long DEFAULT_Z_ACCEL = 100;
+
+// Motor P defaults
+const long DEFAULT_P_MAX_SPEED = 200;
+const long DEFAULT_P_ACCEL = 100;
+
+// Motor Q defaults
+const long DEFAULT_Q_MAX_SPEED = 200;
+const long DEFAULT_Q_ACCEL = 100;
+
+// Global emergency stop flag for steppers and servo
+bool emergencyStopActive = false;
+
+/* ---------------------------
+   Pending Command Buffer
+   --------------------------- */
+char pendingCommand[150];
+bool commandPending = false;
+
+/* ---------------------------
+   Structure for Motor Commands
+   --------------------------- */
+struct MotorCommand {
+  AccelStepper* stepper;
+  long steps; // positive or negative value indicating movement
+};
+
+/* -------------------------
+   Emergency Stop Functions
+   ------------------------- */
+void emergencyStop() {
+  Serial.println("🚨 Emergency Stop Activated!");
+  emergencyStopActive = true;
+  // Stop all stepper motors and disable outputs.
+  for (int i = 0; i < 5; i++){
+    steppers[i]->stop();
+    steppers[i]->setCurrentPosition(0);
+    steppers[i]->disableOutputs();
+  }
+  Serial.println("All motors stopped.");
+}
+
+void reinitMotors(){
+  Serial.println("Reinitializing motors...");
+  for (int i = 0; i < 5; i++){
+    steppers[i]->enableOutputs();
+    steppers[i]->setCurrentPosition(0);
+  }
+  emergencyStopActive = false;
+  Serial.println("Motors reinitialized. Ready for new commands.");
+}
+
+// Non-blocking emergency check during movement loops.
+void checkForEmergencyStop() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.equalsIgnoreCase("s")) {
+      emergencyStop();
+    }
+  }
+}
+
+/* ---------------------------
+   Parse a Sub-Command for Simultaneous Execution
+   --------------------------- */
+// This function parses a sub-command (e.g., "z -20.00") into a MotorCommand structure.
+bool parseSubCommandSimultaneous(char* subCmd, MotorCommand &cmd) {
+  char* tokens[5];
+  int tokenCount = 0;
+  char* token = strtok(subCmd, " ");
+  while(token != NULL && tokenCount < 5) {
+    tokens[tokenCount++] = token;
+    token = strtok(NULL, " ");
+  }
+  if (tokenCount == 0) return false;
+  
+  // First token: motor identifier.
+  char motor = tokens[0][0];
+  AccelStepper* stepper = NULL;
+  for (int i = 0; i < 5; i++) {
+    if ((char)tolower(motor) == motorLabels[i]) {
+      stepper = steppers[i];
+      break;
+    }
+  }
+  if (stepper == NULL) {
+    Serial.print("Invalid motor identifier: ");
+    Serial.println(motor);
+    return false;
+  }
+  
+  char dir;
+  float angle = 0;
+  long speed = 0, acceleration = 0;
+  float originalAngle = 0;
+  if (tokenCount == 2) { // Manual command: <motor> <angle>
+    originalAngle = atof(tokens[1]);
+    if (originalAngle < 0) {
+      dir = 'f';
+      angle = -originalAngle;
+    } else {
+      dir = 'b';
+      angle = originalAngle;
+    }
+    // Use default settings.
+    if (tolower(motor) == 'x'){
+      speed = DEFAULT_X_MAX_SPEED; 
+      acceleration = DEFAULT_X_ACCEL;
+    } else if (tolower(motor) == 'y'){
+      speed = DEFAULT_Y_MAX_SPEED; 
+      acceleration = DEFAULT_Y_ACCEL;
+    } else if (tolower(motor) == 'z'){
+      speed = DEFAULT_Z_MAX_SPEED; 
+      acceleration = DEFAULT_Z_ACCEL;
+    } else if (tolower(motor) == 'p'){
+      speed = DEFAULT_P_MAX_SPEED; 
+      acceleration = DEFAULT_P_ACCEL;
+    } else if (tolower(motor) == 'q'){
+      speed = DEFAULT_Q_MAX_SPEED; 
+      acceleration = DEFAULT_Q_ACCEL;
+    }
+  } else if (tokenCount == 5) { // Full command: <motor> <direction> <angle> <speed> <acceleration>
+    dir = tokens[1][0];
+    originalAngle = atof(tokens[2]);
+    angle = (originalAngle < 0) ? -originalAngle : originalAngle;
+    speed = atol(tokens[3]);
+    acceleration = atol(tokens[4]);
+  } else {
+    Serial.println("Invalid command format.");
+    return false;
+  }
+  
+  // Set the motor's speed and acceleration.
+  stepper->setMaxSpeed(speed);
+  stepper->setAcceleration(acceleration);
+  
+  long steps = 0;
+  if (tolower(motor) == 'x') {
+    float effectiveAngle = angle * scaleFactorX;
+    steps = (long)(effectiveAngle * stepsPerDegree);
+  } else if (tolower(motor) == 'y') {
+    float effectiveAngle = angle * scaleFactorY;
+    steps = (long)(effectiveAngle * stepsPerDegree);
+  } else if (tolower(motor) == 'z') {
+    float effectiveAngle = angle * scaleFactorZ;
+    steps = (long)(effectiveAngle * stepsPerDegree);
+  } else if (tolower(motor) == 'q') {
+    float effectiveAngle = angle * scaleFactorQ;
+    steps = (long)(effectiveAngle * stepsPerDegree);
+  } else { // For motor 'p'
+    steps = (long)(angle * stepsPerDegree);
+  }
+  
+  // Apply direction.
+  if (dir == 'f') {
+    // Forward: steps remain positive.
+  } else if (dir == 'b') {
+    steps = -steps;
+  } else {
+    Serial.println("Invalid direction.");
+    return false;
+  }
+  
+  // Debug message for this motor.
+  Serial.print((char)tolower(motor));
+  Serial.print(" motor: original angle = ");
+  Serial.print(originalAngle, 2);
+  Serial.print(" → steps = ");
+  Serial.println(steps);
+  
+  cmd.stepper = stepper;
+  cmd.steps = steps;
+  return true;
+}
+
+/* ---------------------------
+   Execute All Buffered Commands Simultaneously
+   --------------------------- */
+void executeSimultaneousCommands() {
+  const int maxCommands = 5;
+  MotorCommand commands[maxCommands];
+  int count = 0;
+  
+  // Copy pendingCommand into a temporary buffer.
+  char tempBuffer[150];
+  strncpy(tempBuffer, pendingCommand, sizeof(tempBuffer)-1);
+  tempBuffer[sizeof(tempBuffer)-1] = '\0';
+  
+  // Use strtok_r for reentrant tokenization.
+  char* saveptr;
+  char* token = strtok_r(tempBuffer, ",", &saveptr);
+  while (token != NULL && count < maxCommands) {
+    while (*token == ' ') token++;
+    char tokenCopy[50];
+    strncpy(tokenCopy, token, sizeof(tokenCopy)-1);
+    tokenCopy[sizeof(tokenCopy)-1] = '\0';
+    
+    Serial.print("Parsing token: ");
+    Serial.println(tokenCopy);
+    
+    if (parseSubCommandSimultaneous(tokenCopy, commands[count])) {
+      count++;
+    }
+    token = strtok_r(NULL, ",", &saveptr);
+  }
+  
+  Serial.print("Total commands parsed: ");
+  Serial.println(count);
+  
+  if (count == 0) {
+    Serial.println("No valid commands to execute.");
+    return;
+  }
+  
+  // Command each motor to move.
+  for (int i = 0; i < count; i++) {
+    commands[i].stepper->move(commands[i].steps);
+  }
+  
+  // Run all motors concurrently until all finish.
+  bool anyRunning = true;
+  while (anyRunning && !emergencyStopActive) {
+    anyRunning = false;
+    for (int i = 0; i < count; i++) {
+      if (commands[i].stepper->distanceToGo() != 0) {
+        anyRunning = true;
+        commands[i].stepper->run();
+      }
+    }
+    checkForEmergencyStop();
+  }
+  Serial.println("Simultaneous motor movement completed.");
+  // Send an ACK to indicate completion.
+  Serial.println("ACK");
+}
+
+/* ---------------------------
+   Servo (Gripper) Configuration
+   --------------------------- */
+Servo gripper;
+const int gripperPin = 11;   // Servo output pin
+const int servoCenter = 90;  // Center offset (absolute = servoCenter + relative)
+int currentRelGripper = -90; // Start fully open (-90 relative gives 0° absolute)
+int targetRelGripper = -90;  // Target relative position
+unsigned long gripperLastUpdate = 0;
+const unsigned long gripperStepDelay = 50;  // ms per step delay
+bool gripperMovementActive = false;
+
+void updateGripper() {
+  if (emergencyStopActive) {
+    gripperMovementActive = false;
+    return;
+  }
+  if (gripperMovementActive) {
+    unsigned long currentTime = millis();
+    if (currentTime - gripperLastUpdate >= gripperStepDelay) {
+      gripperLastUpdate = currentTime;
+      if (currentRelGripper < targetRelGripper) {
+        currentRelGripper += 5;
+        if (currentRelGripper > targetRelGripper)
+          currentRelGripper = targetRelGripper;
+      } else if (currentRelGripper > targetRelGripper) {
+        currentRelGripper -= 5;
+        if (currentRelGripper < targetRelGripper)
+          currentRelGripper = targetRelGripper;
+      }
+      int absAngle = servoCenter + currentRelGripper;
+      gripper.write(absAngle);
+      Serial.print("Gripper moving... Relative: ");
+      Serial.print(currentRelGripper);
+      Serial.print("°, Absolute: ");
+      Serial.println(absAngle);
+      
+      if (currentRelGripper == targetRelGripper) {
+        gripperMovementActive = false;
+        Serial.print("Gripper target reached. Position: Relative ");
+        Serial.print(currentRelGripper);
+        Serial.print("°, Absolute ");
+        Serial.println(servoCenter + currentRelGripper);
+      }
+    }
+  }
+}
+
+void processGripperCommand(String command) {
+  command = command.substring(1);
+  command.trim();
+  if (command.equalsIgnoreCase("h")) {
+    gripperMovementActive = false;
+    Serial.println("Gripper movement halted.");
+  } else {
+    int newTarget = command.toInt();
+    if (newTarget < -90 || newTarget > 90) {
+      Serial.println("Invalid gripper angle! Use a value between -90 and 90.");
+    } else {
+      targetRelGripper = newTarget;
+      gripperMovementActive = true;
+      Serial.print("Gripper new target set: ");
+      Serial.print(targetRelGripper);
+      Serial.println(" (relative angle).");
+    }
+  }
+}
+
+/* ---------------------------
+   Handle Inverse Kinematics (IK) Input
+   --------------------------- */
+// If the input is a comma-separated list of numbers, interpret them as IK angles
+// in the order: Z (base), Y (shoulder), X (upper arm), Q (wrist).
+void processIKInput(char* input) {
+  char temp[100];
+  strncpy(temp, input, sizeof(temp)-1);
+  temp[sizeof(temp)-1] = '\0';
+  
+  float angles[4] = {0};
+  int count = 0;
+  char* token = strtok(temp, ",");
+  while (token != NULL && count < 4) {
+    angles[count++] = atof(token);
+    token = strtok(NULL, ",");
+  }
+  
+  if (count != 4) {
+    Serial.println("Invalid IK input. Expecting 4 angles.");
+    return;
+  }
+  
+  // Build the pending command string in the order: Z, Y, X, Q.
+  char angleStr[10];
+  strcpy(pendingCommand, "");
+  
+  dtostrf(angles[0], 4, 2, angleStr);
+  strcat(pendingCommand, "z ");
+  strcat(pendingCommand, angleStr);
+  strcat(pendingCommand, ", ");
+  
+  dtostrf(angles[1], 4, 2, angleStr);
+  strcat(pendingCommand, "y ");
+  strcat(pendingCommand, angleStr);
+  strcat(pendingCommand, ", ");
+  
+  dtostrf(angles[2], 4, 2, angleStr);
+  strcat(pendingCommand, "x ");
+  strcat(pendingCommand, angleStr);
+  strcat(pendingCommand, ", ");
+  
+  dtostrf(angles[3], 4, 2, angleStr);
+  strcat(pendingCommand, "q ");
+  strcat(pendingCommand, angleStr);
+  
+  commandPending = true;
+  Serial.print("IK joint angles received and buffered: ");
+  Serial.println(pendingCommand);
+  Serial.println("Type 'e' to execute the buffered command(s) simultaneously.");
+  // Send an ACK to indicate reception.
+  Serial.println("ACK");
+}
+
+/* ---------------------------
+   Setup & Main Loop
+   --------------------------- */
+void setup() {
+  Serial.begin(9600);
+  delay(2000);
+  
+  // Initialize steppers.
+  stepperX.setMaxSpeed(DEFAULT_X_MAX_SPEED);
+  stepperX.setAcceleration(DEFAULT_X_ACCEL);
+  
+  stepperY.setMaxSpeed(DEFAULT_Y_MAX_SPEED);
+  stepperY.setAcceleration(DEFAULT_Y_ACCEL);
+  
+  stepperZ.setMaxSpeed(DEFAULT_Z_MAX_SPEED);
+  stepperZ.setAcceleration(DEFAULT_Z_ACCEL);
+  
+  stepperE0.setMaxSpeed(DEFAULT_P_MAX_SPEED);
+  stepperE0.setAcceleration(DEFAULT_P_ACCEL);
+  
+  stepperE1.setMaxSpeed(DEFAULT_Q_MAX_SPEED);
+  stepperE1.setAcceleration(DEFAULT_Q_ACCEL);
+  
+  // Print instructions.
+  Serial.println("Stepper Control Commands:");
+  Serial.println(" - Type 's' at any time for an emergency stop.");
+  Serial.println(" - Buffered commands require pressing 'e' to execute simultaneously.");
+  Serial.println(" - Commands can be given as:");
+  Serial.println("     Full: <motor> <direction> <angle> <speed> <acceleration>");
+  Serial.println("     Manual: <motor> <angle>   (angle sign: -ve = forward, +ve = backward)");
+  Serial.println("   Multiple commands can be separated by commas.");
+  Serial.println(" - IK Input: A comma-separated list of 4 angles (order: Z, Y, X, Q).");
+  Serial.println("   Negative values indicate forward movement, positive backward.");
+  Serial.println(" - Gripper Commands: Format: g <angle> (e.g., g -90 for open, g 20 for closed)");
+  Serial.println(" - Example Manual command: \"x -90, y 45, z -30, q -20\"");
+  
+  // Setup gripper.
+  gripper.attach(gripperPin);
+  currentRelGripper = -90;
+  targetRelGripper = -90;
+  gripper.write(servoCenter + currentRelGripper);
+  Serial.print("Gripper initial position: Relative ");
+  Serial.print(currentRelGripper);
+  Serial.print("°, Absolute ");
+  Serial.println(servoCenter + currentRelGripper);
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char inputBuffer[150];
+    int n = Serial.readBytesUntil('\n', inputBuffer, sizeof(inputBuffer) - 1);
+    inputBuffer[n] = '\0';
+    for (int i = 0; i < n; i++) {
+      if (inputBuffer[i] == '\r') {
+        inputBuffer[i] = '\0';
+        break;
+      }
+    }
+    
+    // Process emergency stop immediately.
+    if (strcmp(inputBuffer, "s") == 0 || strcmp(inputBuffer, "S") == 0) {
+      emergencyStop();
+      gripperMovementActive = false;
+      commandPending = false;
+      pendingCommand[0] = '\0';
+      return;
+    }
+    
+    // Check if input is an IK input.
+    bool isIKInput = true;
+    for (int i = 0; i < strlen(inputBuffer); i++) {
+      char c = inputBuffer[i];
+      if (!isdigit(c) && c != '.' && c != '-' && c != ',' && c != ' ' && c != '\t') {
+        isIKInput = false;
+        break;
+      }
+    }
+    if (isIKInput && strlen(inputBuffer) > 0) {
+      processIKInput(inputBuffer);
+      return;
+    }
+    
+    // Process execution command 'e'
+    if (strcmp(inputBuffer, "e") == 0 || strcmp(inputBuffer, "E") == 0) {
+      if (commandPending) {
+        Serial.print("Executing buffered command(s): ");
+        Serial.println(pendingCommand);
+        if (emergencyStopActive) {
+          reinitMotors();
+        }
+        executeSimultaneousCommands();
+        commandPending = false;
+        pendingCommand[0] = '\0';
+      } else {
+        Serial.println("No buffered command to execute.");
+      }
+    }
+    // Process gripper commands.
+    else if (inputBuffer[0] == 'g' || inputBuffer[0] == 'G') {
+      processGripperCommand(String(inputBuffer));
+    }
+    // Otherwise, buffer the command(s).
+    else {
+      strncpy(pendingCommand, inputBuffer, sizeof(pendingCommand) - 1);
+      pendingCommand[sizeof(pendingCommand) - 1] = '\0';
+      commandPending = true;
+      Serial.print("Command(s) buffered: ");
+      Serial.println(pendingCommand);
+      Serial.println("Type 'e' to execute the buffered command(s) simultaneously.");
+    }
+  }
+  
+  updateGripper();
+}
